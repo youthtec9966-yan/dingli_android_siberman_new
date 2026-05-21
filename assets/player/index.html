@@ -1,0 +1,1167 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live2D Player</title>
+<style>
+html,body{margin:0;height:100%;background:#000 url('/res/image/bk.png') no-repeat center center;background-size:cover}
+canvas{display:block}
+ .chat-panel{position:fixed;top:0;right:0;width:30vw;height:100vh;background:rgba(17,24,39,.35);backdrop-filter:blur(4px);color:#fff;overflow-y:auto;padding:12px;box-sizing:border-box;z-index:10;border-left:1px solid #374151}
+.portrait .chat-panel{top:auto;bottom:0;left:0;right:auto;width:100vw;height:32vh;border-left:none;border-top:1px solid #374151;font-size:28px}
+ .chat-list{display:flex;flex-direction:column}
+.msg{max-width:88%;margin:10px 0;padding:12px 16px;border-radius:12px;line-height:1.5;font-size:36px;word-break:break-word;font-weight:800}
+.msg p{margin:0 0 10px}
+.msg p:last-child{margin-bottom:0}
+.msg pre{margin:10px 0;padding:10px;border-radius:8px;background:rgba(0,0,0,.35);overflow:auto}
+.msg code{padding:2px 6px;border-radius:6px;background:rgba(0,0,0,.35)}
+.msg a{color:#93c5fd;text-decoration:underline}
+.msg ul,.msg ol{margin:6px 0 10px 22px}
+.msg blockquote{margin:8px 0;padding-left:12px;border-left:3px solid #4b5563;color:#d1d5db}
+.user{align-self:flex-start;background:#1f2937}
+.user.pending{background:#9ca3af;color:#111827;animation:userPendingPulse 1.25s ease-in-out infinite}
+.assistant{align-self:flex-end;background:#374151}
+.msg .speaking-current{color:#fde68a;text-shadow:0 0 10px rgba(253,230,138,.35)}
+@keyframes userPendingPulse{
+  0%{opacity:.92;transform:translateZ(0)}
+  50%{opacity:1;filter:brightness(1.08)}
+  100%{opacity:.92;transform:translateZ(0)}
+}
+ .selector{position:fixed;left:0;bottom:calc(28vh + 8px);background:rgba(17,24,39,.75);backdrop-filter:blur(4px);color:#fff;padding:8px;z-index:10}
+.portrait .selector{left:0;bottom:calc(32vh + 8px)}
+.selector select{min-width:280px;background:#111827;color:#fff;border:1px solid #374151;border-radius:6px;padding:6px}
+.portrait .msg{font-size:24px}
+</style>
+<script src="./pixi.min.js"></script>
+<script src="./live2dcubismcore.min.js"></script>
+<script src="./cubism4.min.js"></script>
+</head>
+<link rel="icon" href="/res/image/logo.ico">
+<body>
+<div id="chat" class="chat-panel"><div class="chat-list"></div></div>
+<div id="selector" class="selector" style="display:none"><select id="modelSelect"><option value="">加载中...</option></select> <select id="motionSelect" disabled><option value="">动作列表</option></select></div>
+<script>
+const app = new PIXI.Application({ resizeTo: window, backgroundAlpha: 0, antialias: true });
+window.PIXI = PIXI;
+document.body.appendChild(app.view);
+const urlParams = new URLSearchParams(window.location.search);
+const fixedWsScheme = urlParams.get('wsScheme');
+const fixedWsHost = urlParams.get('wsHost');
+const isAndroidAssets = window.location.hostname === 'appassets.androidplatform.net';
+const defaultModelUrl = '/models/police1124/%E8%AD%A6%E5%AF%9F%E6%8B%86.model3.json';
+
+// --- Apply Font Size from URL ---
+try {
+  const fontSize = urlParams.get('fontsize');
+  if (fontSize) {
+    const style = document.createElement('style');
+    style.innerHTML = `.msg { font-size: ${fontSize}px !important; }`;
+    document.head.appendChild(style);
+  }
+} catch (e) { console.error("Failed to set font size", e); }
+// --------------------------------
+
+let model;
+let lastModelUrl = '';
+let modelLoadRetryCount = 0;
+
+function frontendLog(text) {
+  try { console.log(text); } catch {}
+  try {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'LOG', text }));
+    }
+  } catch {}
+}
+
+window.addEventListener('error', (event) => {
+  const message = event && event.message ? event.message : 'unknown error';
+  frontendLog('[FrontendError] ' + message);
+});
+
+window.addEventListener('unhandledrejection', (event) => {
+  const reason = event && event.reason ? (event.reason.message || String(event.reason)) : 'unknown rejection';
+  frontendLog('[FrontendRejection] ' + reason);
+});
+
+/**
+ * 判断当前是否为竖屏模式（高 > 宽，即 9:16 之类）
+ */
+function isPortrait(){ return window.innerHeight > window.innerWidth; }
+
+/**
+ * 更新 body 上的竖屏样式类
+ */
+function updateOrientation(){
+  if (isPortrait()) {
+    document.body.classList.add('portrait');
+  } else {
+    document.body.classList.remove('portrait');
+  }
+}
+updateOrientation();
+
+/**
+ * 计算聊天面板的宽度
+ * 横屏：屏幕宽度的 30%；竖屏：面板在底部占全宽，模型可用宽度即为全屏
+ */
+function getChatWidth(){ return isPortrait() ? 0 : Math.floor(window.innerWidth * 0.30); }
+
+/**
+ * 调整 Live2D 模型的大小和位置
+ * 使其适应屏幕剩余空间（避开右侧/底部聊天面板）
+ */
+function fit() {
+  if (!model) return;
+  model.scale.set(1);
+  const w = app.renderer.width;
+  const h = app.renderer.height;
+  const cw = getChatWidth();
+  if (isPortrait()) {
+    const visH = h * 0.68;
+    const sx = w / model.width;
+    const sy = visH / model.height;
+    const s = Math.min(sx, sy) * 0.9;
+    model.scale.set(s);
+    model.x = w * 0.5;
+    model.y = visH * 0.5;
+  } else {
+    const visW = Math.max(0, w - cw);
+    const sx = visW / model.width;
+    const sy = h / model.height;
+    const s = Math.min(sx, sy) * 0.9;
+    model.scale.set(s);
+    model.x = visW * 0.35;
+    model.y = h * 0.5;
+  }
+}
+
+/**
+ * 加载指定的 Live2D 模型
+ * @param {string} url - 模型配置文件 (.model3.json) 的 URL
+ */
+function load(url, retryCount = 0) {
+  lastModelUrl = url || lastModelUrl;
+  if (!PIXI || !PIXI.live2d || !PIXI.live2d.Live2DModel) {
+    showText('Live2D 插件未加载');
+    frontendLog('Live2D 插件未加载');
+    return Promise.reject(new Error('live2d plugin missing'));
+  }
+  try { showText('加载: ' + url); } catch {}
+  frontendLog(`开始加载模型: ${url} attempt=${retryCount + 1}`);
+  return PIXI.live2d.Live2DModel.from(url).then(m => {
+    if (model) { app.stage.removeChild(model); model.destroy({ children: true, texture: true, baseTexture: true }); }
+    model = m;
+    modelLoadRetryCount = 0;
+    app.stage.addChild(model);
+    model.anchor.set(0.5, 0.5);
+    fit();
+  model.once('ready', fit);
+  model.once('load', fit);
+  populateMotionOptions();
+  try { model.once('ready', populateMotionOptions); } catch {}
+  try { model.once('load', populateMotionOptions); } catch {}
+    const settings = model.internalModel.settings;
+    const groups = Object.keys(settings.motions || {});
+    if (groups.length) {
+      const list = settings.motions[groups[0]] || [];
+      let idx = 0;
+      for (let i=0;i<list.length;i++){
+        const f = list[i].File || list[i].file || '';
+        if (f.indexOf('idle') !== -1) { idx = i; break; }
+      }
+      model.internalModel.motionManager.startMotion(groups[0], idx);
+    }
+    frontendLog(`模型加载成功: ${url}`);
+    return m;
+  }).catch(err => {
+    const message = err && err.message ? err.message : String(err);
+    try { showText('加载失败: ' + message); } catch {}
+    frontendLog(`模型加载失败: ${url} error=${message}`);
+    if (retryCount < 2) {
+      modelLoadRetryCount = retryCount + 1;
+      setTimeout(() => { load(url, retryCount + 1); }, 800);
+    }
+  });
+}
+const select = document.getElementById('modelSelect');
+const motionSelect = document.getElementById('motionSelect');
+
+/**
+ * 获取服务器上 models 目录下的子目录列表
+ * 用于发现可用的模型
+ */
+async function listSubdirs(){ try { const res = await fetch('/models/'); const html = await res.text(); const div = document.createElement('div'); div.innerHTML = html; const anchors = Array.from(div.querySelectorAll('a')); const dirs = anchors.map(a => a.getAttribute('href')||'').filter(h=>h.endsWith('/') && !/^\//.test(h)).map(h=>h.replace(/\/$/, '')); return dirs; } catch { return []; } }
+
+/**
+ * 在指定目录中查找 .model3.json 模型配置文件
+ * 优先查找目录下的同名文件，或遍历查找
+ */
+async function findModelJson(dir){ try { const res = await fetch(`/models/${dir}/`); const html = await res.text(); const div = document.createElement('div'); div.innerHTML = html; const a = Array.from(div.querySelectorAll('a')).find(x => /\.model3\.json$/i.test(x.getAttribute('href')||'')); if (a){ const href = a.getAttribute('href')||''; const url = new URL(`/models/${dir}/${href}`, location.origin).href; return url; } } catch {} try { const candidate = `/models/${dir}/${dir}.model3.json`; const r = await fetch(candidate, { method: 'HEAD' }); if (r.ok) return new URL(candidate, location.origin).href; } catch {} return null; }
+
+/**
+ * 初始化模型列表
+ * 获取可用模型，填充下拉框，并加载默认模型
+ */
+async function populateModels(){
+  let dirs = isAndroidAssets ? ['police1124'] : await listSubdirs();
+  if (dirs.length === 0) dirs = ['police1124'];
+  const items = [];
+  for (const d of dirs){
+    let url = d === 'police1124' ? new URL(defaultModelUrl, location.origin).href : await findModelJson(d);
+    if (!url && d === 'police1124') url = new URL(defaultModelUrl, location.origin).href;
+    if (url) items.push({ dir: d, url });
+  }
+  select.innerHTML = '';
+  for (const it of items){
+    const opt = document.createElement('option');
+    opt.value = it.url;
+    opt.textContent = it.dir;
+    select.appendChild(opt);
+  }
+  const targetItem = items.find(it => it.dir === 'police1124');
+  if (targetItem) {
+    select.value = targetItem.url;
+    load(targetItem.url);
+  } else if (items.length > 0) {
+    load(items[0].url);
+  } else {
+    load(new URL(defaultModelUrl, location.origin).href);
+  }
+}
+select.addEventListener('change', () => { const url = select.value; if (url) load(url); });
+
+/**
+ * 填充动作（Motion）选择下拉框
+ * 根据当前加载的模型读取其动作组和文件
+ */
+function populateMotionOptions(){
+  if (!model || !model.internalModel || !model.internalModel.settings){
+    motionSelect.innerHTML = '<option value="">动作列表</option>';
+    motionSelect.disabled = true;
+    return;
+  }
+  const settings = model.internalModel.settings;
+  const motions = settings.motions || {};
+  const items = [];
+  for (const group of Object.keys(motions)){
+    const list = motions[group] || [];
+    for (let i=0;i<list.length;i++){
+      const f = list[i].File || list[i].file || '';
+      items.push({ group, idx: i, file: f });
+    }
+  }
+  motionSelect.innerHTML = '';
+  for (const it of items){
+    const opt = document.createElement('option');
+    opt.value = it.group + '|' + String(it.idx);
+    opt.textContent = (it.group || 'group') + ' / ' + (it.file || 'motion');
+    motionSelect.appendChild(opt);
+  }
+  motionSelect.disabled = items.length === 0;
+  const idle = items.find(x => /idle/i.test(x.file || ''));
+  if (idle){ motionSelect.value = idle.group + '|' + String(idle.idx); }
+}
+motionSelect.addEventListener('change', () => {
+  const v = motionSelect.value;
+  if (!v || !model) return;
+  const parts = v.split('|');
+  const group = parts[0];
+  const idx = parseInt(parts[1] || '0', 10);
+  try { model.internalModel.motionManager.startMotion(group, idx); } catch {}
+});
+const style = new PIXI.TextStyle({ fontFamily: 'system-ui', fontSize: 28, fill: 0xffffff, stroke: 0x000000, strokeThickness: 3, dropShadow: true, dropShadowDistance: 2, align: 'center' });
+const caption = new PIXI.Text('', style);
+caption.anchor.set(0.5, 0);
+caption.x = isPortrait() ? app.renderer.width / 2 : Math.max(0, app.renderer.width - getChatWidth()) / 2;
+caption.y = isPortrait() ? 20 : 30;
+app.stage.addChild(caption);
+
+/** 
+ * 
+ * 显示文本提示
+ * (注：当前实现隐藏了 caption，可能用于调试或暂时禁用了字幕显示)
+ */
+function showText(str) {
+  caption.visible = true;
+}
+const chatPanel = document.getElementById('chat');
+const chatList = chatPanel.querySelector('.chat-list');
+let chatAutoScrollRaf = 0;
+function scheduleChatAutoScroll() {
+  if (chatAutoScrollRaf) return;
+  chatAutoScrollRaf = requestAnimationFrame(() => {
+    chatAutoScrollRaf = 0;
+    if (!chatPanel) return;
+    chatPanel.scrollTop = chatPanel.scrollHeight;
+  });
+}
+let isTTSPlaying = false; // Flag to suppress ASR while speaking
+let ttsQueue = [];
+let isStreaming = false;
+let isProcessingTtsQueue = false;
+let backendTtsReqSeq = 0;
+const pendingTtsCallbacks = new Map();
+
+function processTtsQueue() {
+    if (isProcessingTtsQueue) {
+        return;
+    }
+    if (ttsQueue.length === 0) {
+        return;
+    }
+    isProcessingTtsQueue = true;
+    while (ttsQueue.length > 0) {
+      const chunk = ttsQueue.shift();
+      speak(chunk);
+    }
+    isProcessingTtsQueue = false;
+}
+
+/**
+ * 核心 TTS (文本转语音) 函数
+ * 停止 ASR，调用浏览器语音合成朗读文本，并同步口型和动作
+ */
+function speak(text, onEnd) {
+  if (!text) return;
+  const ttsText = text.replace(/[\*#`~]+/g, '').trim();
+  if (!ttsText) {
+    if (onEnd) onEnd();
+    return;
+  }
+  isTTSPlaying = true;
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    isTTSPlaying = false;
+    if (onEnd) onEnd();
+    return;
+  }
+  const reqId = `tts_${Date.now()}_${++backendTtsReqSeq}`;
+  pendingTtsCallbacks.set(reqId, onEnd || null);
+  ws.send(JSON.stringify({ type: 'TTS_SYNTH', req_id: reqId, text: ttsText }));
+}
+
+let waitingForClose = false;
+
+/**
+ * 向聊天面板添加一条新的消息记录
+ * @param {string} role - 'user' 或 'assistant'
+ * @param {string} text - 消息内容
+ */
+function escapeHtml(str) {
+  return (str || '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+}
+
+function renderMarkdown(text) {
+  let raw = text || '';
+  const codeBlocks = [];
+  raw = raw.replace(/```([\s\S]*?)```/g, (_, code) => {
+    const idx = codeBlocks.length;
+    codeBlocks.push(`<pre><code>${escapeHtml(code.replace(/\n$/, ''))}</code></pre>`);
+    return `@@CODEBLOCK${idx}@@`;
+  });
+  let t = escapeHtml(raw);
+  t = t.replace(/\r\n/g, '\n');
+  t = t.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  t = t.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  t = t.replace(/(^|[^*])\*([^*\n]+)\*(?=[^*]|$)/g, (m, p1, p2) => `${p1}<em>${p2}</em>`);
+  t = t.replace(/`([^`]+)`/g, '<code>$1</code>');
+  let html = t.split(/\n{2,}/).map(p => `<p>${p.replace(/\n/g, '<br>')}</p>`).join('');
+  html = html.replace(/@@CODEBLOCK(\d+)@@/g, (m, i) => codeBlocks[Number(i)] || m);
+  return html;
+}
+
+function renderPlainText(text) {
+  return escapeHtml(text || '').replace(/\r\n/g, '\n').replace(/\n/g, '<br>');
+}
+
+function setMsgContent(el, text, options = null) {
+  el.dataset.raw = text || '';
+  const baseText = options && typeof options.baseText === 'string' ? options.baseText : '';
+  const highlightText = options && typeof options.highlightText === 'string' ? options.highlightText : '';
+  if (highlightText) {
+    el.innerHTML = `${renderPlainText(baseText)}<span class="speaking-current">${renderPlainText(highlightText)}</span>`;
+    if (el.isConnected) scheduleChatAutoScroll();
+    return;
+  }
+  el.innerHTML = renderMarkdown(el.dataset.raw);
+  if (el.isConnected) scheduleChatAutoScroll();
+}
+
+function appendMsg(role, text){
+  if (!text) return;
+
+  // Check for explicit "No" response if we are waiting for close
+  if (role === 'user' && waitingForClose) {
+     if (text.includes('没有') || text.includes('没') || text.includes('不需要')) {
+         if (ws && ws.readyState === WebSocket.OPEN) {
+             ws.send(JSON.stringify({ type: 'CLOSE_PLAYER' }));
+         }
+         return; 
+     }
+     waitingForClose = false;
+  }
+
+  const item = document.createElement('div');
+  item.className = 'msg ' + (role === 'user' ? 'user' : 'assistant');
+  setMsgContent(item, text);
+  chatList.appendChild(item);
+  scheduleChatAutoScroll();
+}
+
+let ws;
+let pendingUserItem = null;
+let turnLocked = false;
+let currentAssistantItem = null;
+let currentAssistantText = '';
+let currentAssistantCommittedText = '';
+let currentAssistantRevealTimer = null;
+let currentAssistantRevealReqId = null;
+let currentAssistantRevealBaseText = '';
+let currentAssistantRevealSegmentText = '';
+let currentAssistantRevealStartedAt = 0;
+let currentAssistantRevealAudioEl = null;
+const finishedAssistantRevealReqIds = new Set();
+let pendingAssistantStreamText = '';
+let assistantSpeechStartedThisTurn = false;
+let assistantSpeechQueuedThisTurn = false;
+
+function clearAssistantRevealTimer(resetState = true) {
+  if (currentAssistantRevealTimer) {
+    clearInterval(currentAssistantRevealTimer);
+    currentAssistantRevealTimer = null;
+  }
+  if (resetState) {
+    currentAssistantRevealReqId = null;
+    currentAssistantRevealBaseText = '';
+    currentAssistantRevealSegmentText = '';
+    currentAssistantRevealStartedAt = 0;
+    currentAssistantRevealAudioEl = null;
+  }
+}
+
+function releaseAssistantTurnContext() {
+  clearAssistantRevealTimer();
+  currentAssistantItem = null;
+  currentAssistantText = '';
+  currentAssistantCommittedText = '';
+  finishedAssistantRevealReqIds.clear();
+  pendingAssistantStreamText = '';
+  assistantSpeechStartedThisTurn = false;
+  assistantSpeechQueuedThisTurn = false;
+}
+
+function ensureAssistantItem() {
+  if (currentAssistantItem && currentAssistantItem.parentNode) {
+    return currentAssistantItem;
+  }
+  const item = document.createElement('div');
+  item.className = 'msg assistant streaming';
+  item.dataset.raw = '';
+  chatList.appendChild(item);
+  scheduleChatAutoScroll();
+  currentAssistantItem = item;
+  currentAssistantText = '';
+  currentAssistantCommittedText = '';
+  return item;
+}
+
+function setAssistantItemText(text) {
+  const item = ensureAssistantItem();
+  currentAssistantText = text || '';
+  setMsgContent(item, currentAssistantText);
+}
+
+function setAssistantRevealItemText(baseText, revealText) {
+  const item = ensureAssistantItem();
+  const safeBaseText = baseText || '';
+  const safeRevealText = revealText || '';
+  currentAssistantText = safeBaseText + safeRevealText;
+  setMsgContent(item, currentAssistantText, {
+    baseText: safeBaseText,
+    highlightText: safeRevealText
+  });
+}
+
+function commitAssistantItemText(text) {
+  currentAssistantCommittedText = text || '';
+  setAssistantItemText(currentAssistantCommittedText);
+}
+
+function beginAssistantTurn(seedText = '') {
+  const item = ensureAssistantItem();
+  item.classList.add('streaming');
+  if (seedText) {
+    pendingAssistantStreamText = seedText;
+  }
+  return item;
+}
+
+function finishAssistantTurn() {
+  if (currentAssistantItem && currentAssistantItem.parentNode) {
+    if (!isTTSPlaying && !currentAssistantRevealTimer) {
+      currentAssistantItem.classList.remove('streaming');
+    }
+  }
+}
+
+function estimateRevealDurationSeconds(text) {
+  const clean = (text || '').trim();
+  if (!clean) return 0.8;
+  const punctuationCount = (clean.match(/[，。！？；：,.!?;:]/g) || []).length;
+  return Math.max(0.9, clean.length / 6.2 + punctuationCount * 0.08);
+}
+
+function syncAssistantRevealProgress(forceFull = false) {
+  if (!currentAssistantRevealSegmentText) return;
+  let ratio = 0;
+  if (forceFull) {
+    ratio = 1;
+  } else if (
+    currentAssistantRevealAudioEl &&
+    Number.isFinite(currentAssistantRevealAudioEl.duration) &&
+    currentAssistantRevealAudioEl.duration > 0
+  ) {
+    ratio = currentAssistantRevealAudioEl.currentTime / currentAssistantRevealAudioEl.duration;
+  } else {
+    const elapsed = Math.max(0, performance.now() - currentAssistantRevealStartedAt) / 1000;
+    ratio = elapsed / estimateRevealDurationSeconds(currentAssistantRevealSegmentText);
+  }
+  ratio = Math.max(0, Math.min(1, ratio));
+  const revealCount = forceFull ? currentAssistantRevealSegmentText.length : Math.max(1, Math.ceil(currentAssistantRevealSegmentText.length * ratio));
+  setAssistantRevealItemText(currentAssistantRevealBaseText, currentAssistantRevealSegmentText.slice(0, revealCount));
+  if (ratio >= 1) {
+    clearAssistantRevealTimer(false);
+  }
+}
+
+function startAssistantSpeechReveal(reqId, text, audioEl = null) {
+  const cleanText = (text || '').replace(/[\*#`~]+/g, '').trim();
+  if (!cleanText) return;
+  beginAssistantTurn(cleanText);
+  clearAssistantRevealTimer();
+  assistantSpeechStartedThisTurn = true;
+  currentAssistantRevealReqId = reqId || null;
+  if (reqId) {
+    finishedAssistantRevealReqIds.delete(reqId);
+  }
+  currentAssistantRevealBaseText = currentAssistantText && currentAssistantText.length > currentAssistantCommittedText.length
+    ? currentAssistantText
+    : (currentAssistantCommittedText || currentAssistantText || '');
+  currentAssistantRevealSegmentText = cleanText;
+  currentAssistantRevealStartedAt = performance.now();
+  currentAssistantRevealAudioEl = audioEl;
+  syncAssistantRevealProgress(false);
+  currentAssistantRevealTimer = setInterval(() => {
+    syncAssistantRevealProgress(false);
+  }, 60);
+}
+
+function finishAssistantSpeechReveal(reqId = null, fallbackText = '') {
+  if (reqId && finishedAssistantRevealReqIds.has(reqId)) {
+    return;
+  }
+  if (reqId && currentAssistantRevealReqId && reqId !== currentAssistantRevealReqId) {
+    return;
+  }
+  const normalizedFallbackText = (fallbackText || '').replace(/[\*#`~]+/g, '').trim();
+  const baseText = currentAssistantRevealReqId
+    ? (currentAssistantRevealBaseText || '')
+    : (currentAssistantText && currentAssistantText.length > currentAssistantCommittedText.length
+        ? currentAssistantText
+        : (currentAssistantCommittedText || currentAssistantText || ''));
+  const finalText = currentAssistantRevealSegmentText || normalizedFallbackText;
+  if (finalText) {
+    const nextText = baseText.endsWith(finalText) ? baseText : `${baseText}${finalText}`;
+    commitAssistantItemText(nextText);
+    if (reqId) {
+      finishedAssistantRevealReqIds.add(reqId);
+    }
+  } else if (pendingAssistantStreamText && !currentAssistantText) {
+    commitAssistantItemText(pendingAssistantStreamText);
+  }
+  clearAssistantRevealTimer();
+  if (currentAssistantItem && currentAssistantItem.parentNode && !isStreaming) {
+    currentAssistantItem.classList.remove('streaming');
+  }
+}
+
+// ---- Streaming TTS Variables ----
+let ttsAudioEl = null;
+let ttsMediaSource = null;
+let ttsSourceBuffer = null;
+let ttsChunkQueue = [];
+let ttsIsAppending = false;
+let currentTtsReqId = null;
+let currentTtsText = '';
+let ttsPendingBytes = 0;
+let ttsPlaybackStarted = false;
+let ttsStreamEnded = false;
+const TTS_MIN_START_BYTES = 24576;
+const TTS_MIN_START_CHUNKS = 3;
+
+function syncStreamingSpeechVisuals(active) {
+    if (active) {
+        startTalkingMotions();
+        startLip(currentTtsText, 1.0);
+        return;
+    }
+    stopLip();
+    stopTalkingMotions();
+}
+
+function maybeStartStreamingPlayback() {
+    if (!ttsAudioEl || ttsPlaybackStarted) return;
+    if (!ttsSourceBuffer || !ttsMediaSource || ttsMediaSource.readyState !== 'open') return;
+    const enoughBuffered = ttsPendingBytes >= TTS_MIN_START_BYTES || ttsChunkQueue.length >= TTS_MIN_START_CHUNKS;
+    if (!ttsStreamEnded && !enoughBuffered) return;
+    ttsPlaybackStarted = true;
+    ttsAudioEl.play().catch(e => {
+        console.error("Play error:", e);
+        ttsAudioEl.onended();
+    });
+}
+
+function processTtsStreamQueue() {
+    if (!ttsSourceBuffer || ttsIsAppending || ttsChunkQueue.length === 0) return;
+    if (!ttsMediaSource || ttsMediaSource.readyState !== 'open') return;
+    
+    ttsIsAppending = true;
+    const chunk = ttsChunkQueue.shift();
+    try {
+        ttsSourceBuffer.appendBuffer(chunk);
+    } catch (e) {
+        console.error("AppendBuffer error:", e);
+        ttsIsAppending = false;
+    }
+}
+// ---------------------------------
+
+function clearPendingUserItem() {
+  if (pendingUserItem && pendingUserItem.parentNode) {
+    pendingUserItem.parentNode.removeChild(pendingUserItem);
+  }
+  pendingUserItem = null;
+}
+
+function resetTurnState() {
+  turnLocked = false;
+  clearPendingUserItem();
+  releaseAssistantTurnContext();
+}
+
+async function ensureFullscreen() {
+  try { window.focus(); } catch {}
+  try {
+    if (!document.fullscreenElement && document.documentElement && document.documentElement.requestFullscreen) {
+      await document.documentElement.requestFullscreen();
+    }
+  } catch {}
+}
+
+/**
+ * 建立 WebSocket 连接
+ * 处理后端发来的消息（如切换模型、播放动作、TTS文本等）
+ * 并处理断线重连
+ */
+function connect() {
+  const wsScheme = fixedWsScheme || (window.location.protocol === 'https:' ? 'wss' : 'ws');
+  const wsHost = fixedWsHost || window.location.hostname || '127.0.0.1';
+  ws = new WebSocket(`${wsScheme}://${wsHost}:3399/`);
+  ws.onmessage = (ev) => {
+    try {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'WAKE_EXISTING' || msg.type === 'WAKE_FULLSCREEN') {
+        resetTurnState();
+        ensureFullscreen();
+        return;
+      }
+      if (msg.type === 'MODEL_CHANGE' && (msg.url || msg.path)) {
+        load(msg.url || msg.path);
+      } else if (msg.type === 'STOP_GENERATION') {
+        interrupt(false);
+      } else if (msg.type === 'ACTION') {
+        if (model) {
+          const s = model.internalModel.settings;
+          const groups = Object.keys(s.motions || {});
+          if (groups.length) {
+            const list = s.motions[groups[0]] || [];
+            const next = Math.floor(Math.random() * list.length);
+            model.internalModel.motionManager.startMotion(groups[0], next);
+          }
+        }
+      } else if (msg.type === 'TTS_CHUNK' && msg.text) {
+        if (isInterrupted) return; // 如果已打断，忽略后续的 chunk
+        const cleanedText = msg.text.replace(/[\*#`~]+/g, '');
+        assistantSpeechQueuedThisTurn = true;
+        ttsQueue.push(cleanedText);
+        if (!isStreaming) {
+            processTtsQueue();
+        }
+      } else if (msg.type === 'TTS_STREAM_START') {
+        assistantSpeechQueuedThisTurn = true;
+        currentTtsReqId = msg.req_id;
+        currentTtsText = (msg.text || '').replace(/[\*#`~]+/g, '');
+        const playbackReqId = currentTtsReqId;
+        const playbackText = currentTtsText;
+        isTTSPlaying = true;
+        syncStreamingSpeechVisuals(false);
+        
+        if (ttsAudioEl) {
+            ttsAudioEl.pause();
+            ttsAudioEl.removeAttribute('src');
+            ttsAudioEl.load();
+        }
+        ttsAudioEl = new Audio();
+        ttsMediaSource = new MediaSource();
+        ttsAudioEl.src = URL.createObjectURL(ttsMediaSource);
+        ttsChunkQueue = [];
+        ttsIsAppending = false;
+        ttsPendingBytes = 0;
+        ttsPlaybackStarted = false;
+        ttsStreamEnded = false;
+        ttsAudioEl.preload = 'auto';
+        
+        ttsAudioEl.onplaying = () => {
+            syncStreamingSpeechVisuals(true);
+            startAssistantSpeechReveal(playbackReqId, playbackText, ttsAudioEl);
+        };
+        
+        ttsAudioEl.onwaiting = () => {
+            syncStreamingSpeechVisuals(false);
+        };
+        
+        ttsAudioEl.onpause = () => {
+            if (!ttsAudioEl || !ttsAudioEl.ended) {
+                syncStreamingSpeechVisuals(false);
+            }
+        };
+        
+        ttsAudioEl.onended = () => {
+            finishAssistantSpeechReveal(playbackReqId, playbackText);
+            syncStreamingSpeechVisuals(false);
+            isTTSPlaying = false;
+            ttsPlaybackStarted = false;
+            ttsStreamEnded = false;
+            ttsPendingBytes = 0;
+            const cb = pendingTtsCallbacks.get(playbackReqId);
+            if (pendingTtsCallbacks.has(playbackReqId)) {
+                pendingTtsCallbacks.delete(playbackReqId);
+            }
+            if (cb) cb();
+            
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'TTS_PLAYED', req_id: playbackReqId }));
+            }
+        };
+        
+        ttsAudioEl.onerror = (e) => {
+            console.error("Audio playback error:", e);
+            ttsAudioEl.onended(); // fallback to end
+        };
+        
+        ttsMediaSource.addEventListener('sourceopen', () => {
+            if (!ttsMediaSource || ttsMediaSource.readyState !== 'open') return;
+            try {
+                ttsSourceBuffer = ttsMediaSource.addSourceBuffer('audio/mpeg');
+                ttsSourceBuffer.addEventListener('updateend', () => {
+                    ttsIsAppending = false;
+                    processTtsStreamQueue();
+                    maybeStartStreamingPlayback();
+                });
+                processTtsStreamQueue();
+                maybeStartStreamingPlayback();
+            } catch (e) {
+                console.error("addSourceBuffer error:", e);
+            }
+        });
+
+      } else if (msg.type === 'TTS_STREAM_CHUNK') {
+        if (msg.req_id !== currentTtsReqId) return;
+        const binaryStr = atob(msg.chunk);
+        const bytes = new Uint8Array(binaryStr.length);
+        for (let i = 0; i < binaryStr.length; i++) {
+            bytes[i] = binaryStr.charCodeAt(i);
+        }
+        ttsPendingBytes += bytes.byteLength;
+        ttsChunkQueue.push(bytes);
+        processTtsStreamQueue();
+        maybeStartStreamingPlayback();
+        
+      } else if (msg.type === 'TTS_STREAM_END') {
+        if (msg.req_id !== currentTtsReqId) return;
+        ttsStreamEnded = true;
+        maybeStartStreamingPlayback();
+        // Optional: signal end of stream when queue is empty
+        const checkEnd = setInterval(() => {
+            if (ttsChunkQueue.length === 0 && !ttsIsAppending) {
+                clearInterval(checkEnd);
+                if (ttsMediaSource && ttsMediaSource.readyState === 'open') {
+                    try { ttsMediaSource.endOfStream(); } catch(e){}
+                }
+            }
+        }, 100);
+        
+      } else if (msg.type === 'TTS_PLAYBACK_START') {
+        const t = (msg.text || '').replace(/[\*#`~]+/g, '');
+        isTTSPlaying = true;
+        assistantSpeechQueuedThisTurn = true;
+        startAssistantSpeechReveal(msg.req_id, t, null);
+        startTalkingMotions();
+        startLip(t, 1.0);
+      } else if (msg.type === 'TTS_PLAYBACK_END') {
+        finishAssistantSpeechReveal(msg.req_id, msg.text || '');
+        stopLip();
+        stopTalkingMotions();
+        isTTSPlaying = false;
+        const cb = pendingTtsCallbacks.get(msg.req_id);
+        if (pendingTtsCallbacks.has(msg.req_id)) {
+          pendingTtsCallbacks.delete(msg.req_id);
+        }
+        if (cb) cb();
+      } else if (msg.type === 'TTS_AUDIO') {
+        if (msg.backend_played) {
+          return;
+        }
+        finishAssistantSpeechReveal(msg.req_id, msg.text || '');
+        stopLip();
+        stopTalkingMotions();
+        isTTSPlaying = false;
+        const cb = pendingTtsCallbacks.get(msg.req_id);
+        if (pendingTtsCallbacks.has(msg.req_id)) {
+          pendingTtsCallbacks.delete(msg.req_id);
+        }
+        if (cb) cb();
+      } else if (msg.type === 'IDLE_PROMPT' && msg.text) {
+        beginAssistantTurn(msg.text);
+        waitingForClose = true;
+        speak(msg.text);
+      } else if (msg.type === 'USER_INPUT_DRAFT' && msg.text) {
+        turnLocked = true;
+        if (pendingUserItem) {
+          pendingUserItem.className = 'msg user pending';
+          setMsgContent(pendingUserItem, msg.text);
+        } else {
+          const item = document.createElement('div');
+          item.className = 'msg user pending';
+          setMsgContent(item, msg.text);
+          chatList.appendChild(item);
+          pendingUserItem = item;
+        }
+      } else if (msg.type === 'USER_INPUT_REVOKE') {
+        resetTurnState();
+      } else if (msg.type === 'USER_INPUT_CONFIRM' && msg.text) {
+        releaseAssistantTurnContext();
+        turnLocked = true;
+        if (pendingUserItem) {
+          pendingUserItem.className = 'msg user';
+          setMsgContent(pendingUserItem, msg.text);
+          pendingUserItem = null;
+        } else {
+          appendMsg('user', msg.text);
+        }
+      } else if (msg.type === 'USER_INPUT') {
+        releaseAssistantTurnContext();
+        turnLocked = true;
+        if (pendingUserItem) {
+          pendingUserItem.classList.remove('pending');
+          setMsgContent(pendingUserItem, msg.text || "");
+          pendingUserItem = null;
+        } else {
+          appendMsg('user', msg.text || "");
+        }
+      } else if (msg.type === 'CHAT_START' && msg.role === 'assistant') {
+        isInterrupted = false; // 新的回复开始，重置打断标记
+        isStreaming = true; // 标记开始接收流式回复
+        pendingAssistantStreamText = '';
+        assistantSpeechStartedThisTurn = false;
+        assistantSpeechQueuedThisTurn = false;
+      } else if (msg.type === 'CHAT_PARTIAL' && msg.text) {
+        isStreaming = true;
+        pendingAssistantStreamText = (pendingAssistantStreamText || '') + msg.text;
+      } else if (msg.type === 'STREAM_END') {
+        isStreaming = false; // 标记流式接收结束
+        if (!assistantSpeechStartedThisTurn && !assistantSpeechQueuedThisTurn && pendingAssistantStreamText) {
+          commitAssistantItemText(pendingAssistantStreamText);
+        }
+        finishAssistantTurn();
+        if (ttsQueue.length > 0) {
+          processTtsQueue();
+        }
+      } else if ((msg.type === 'CHAT_APPEND' || msg.type === 'CHAT') && msg.text) {
+        const role = msg.role === 'user' ? 'user' : 'assistant';
+        if (role === 'assistant') {
+          beginAssistantTurn(msg.text);
+          speak(msg.text);
+        } else {
+          appendMsg(role, msg.text);
+        }
+      } else if (msg.type === 'CHAT_HISTORY_ITEM') {
+          // 只显示历史记录，不朗读
+          const role = msg.role === 'user' ? 'user' : 'assistant';
+          appendMsg(role, msg.text);
+      } else if (msg.type === 'CHAT_CLEAR') {
+        resetTurnState();
+        chatList.innerHTML = '';
+      }
+    } catch {}
+  };
+  ws.onopen = () => {
+    frontendLog('WS Connected');
+    resetTurnState();
+    startAudioMonitorOnly(); // 只启动音频监控(可视化)，不启动浏览器ASR
+  };
+  ws.onclose = () => {
+    frontendLog('WS Closed, retrying...');
+    resetTurnState();
+    // stopASR();
+    setTimeout(connect, 2000);
+  };
+  ws.onerror = (e) => {
+    frontendLog('WS Error');
+    console.error('WS Error', e);
+  };
+}
+connect();
+
+window.addEventListener('resize', () => {
+  updateOrientation();
+  fit();
+  caption.x = isPortrait() ? app.renderer.width / 2 : Math.max(0, app.renderer.width - getChatWidth()) / 2;
+  caption.y = isPortrait() ? 20 : 30;
+});
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    if (document.fullscreenElement) {
+      document.exitFullscreen();
+    } else {
+      window.close();
+    }
+  }
+});
+let talking = false;
+let talkingTimer = null;
+const mouthShapes = { Silence: { open: 0, form: 0 }, A: { open: 1.0, form: 0.0 }, I: { open: 0.0, form: 1.0 }, U: { open: 0.49, form: -1.0 }, E: { open: 0.63, form: 0.83 }, O: { open: 1.0, form: 0.04 } };
+let mouthShape = mouthShapes.Silence;
+
+let isInterrupted = false;
+
+/**
+ * 打断当前的 TTS 和动作，并回复
+ */
+function interrupt(notifyBackend = true) {
+    console.log("Interrupting...");
+
+    ttsQueue = [];
+    isProcessingTtsQueue = false;
+    isStreaming = false;
+    isTTSPlaying = false;
+    isInterrupted = true; // 标记已打断，忽略后续 TTS Chunk
+    ttsPlaybackStarted = false;
+    ttsStreamEnded = false;
+    ttsPendingBytes = 0;
+    
+    if (ttsAudioEl) {
+        ttsAudioEl.pause();
+        ttsAudioEl.removeAttribute('src');
+        ttsAudioEl.load();
+    }
+    
+    // 3. 停止动作
+    stopLip();
+    stopTalkingMotions();
+    
+    // 4. 通知后端停止生成
+    if (notifyBackend && ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'STOP_GENERATION' }));
+    }
+    
+    // 5. 播放应答
+    const reply = "好的";
+    speak(reply);
+}
+
+/**
+ * 仅启动音频监控 (用于可视化)，不进行语音识别
+ */
+async function startAudioMonitorOnly() {
+    console.log("Audio monitor (visualization) disabled to prevent microphone permission prompt.");
+}
+
+/**
+ * 启动语音识别 (Deprecated: 现已改用后端 Alibaba ASR)
+ * 申请麦克风权限并开始监听
+ */
+async function startASR(){
+  console.log("Browser ASR is disabled. Using backend Alibaba ASR.");
+  // Send signal to backend to ensure ASR is in chat mode
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'ASR_START_LOCAL' }));
+  }
+    
+}
+let lipRaf = null;
+let lipPulse = 0;
+let lipPulseUntil = 0;
+let lipNextAt = 0;
+let mouthVal = 0;
+let lipCharMs = 140;
+
+/**
+ * 设置 Live2D 模型的嘴巴张开度
+ * @param {number} v - 0.0 (闭合) 到 1.0 (张开)
+ */
+function setMouth(v){
+  try {
+    if (!model || !model.internalModel || !model.internalModel.coreModel) return;
+    const core = model.internalModel.coreModel;
+    core.setParameterValueById('ParamMouthOpenY', Math.max(0, Math.min(1, v)));
+  } catch(e){}
+}
+
+/**
+ * 设置 Live2D 模型的嘴型 (口形)
+ * @param {number} v - -1.0 到 1.0 (控制嘴巴形状)
+ */
+function setMouthForm(v){
+  try {
+    if (!model || !model.internalModel || !model.internalModel.coreModel) return;
+    const core = model.internalModel.coreModel;
+    core.setParameterValueById('ParamMouthForm', Math.max(-1, Math.min(1, v)));
+  } catch(e){}
+}
+
+/**
+ * 根据字符选择对应的元音嘴型
+ * (A, I, U, E, O, Silence)
+ */
+function pickMouthShape(ch){
+  const c = (ch || '').toLowerCase();
+  if (c === 'a') return mouthShapes.A;
+  if (c === 'e') return mouthShapes.E;
+  if (c === 'i') return mouthShapes.I;
+  if (c === 'o') return mouthShapes.O;
+  if (c === 'u') return mouthShapes.U;
+  if (/\s|[,.!?;:，。！？；：、（）()《》〈〉“”‘’]/.test(c)) return mouthShapes.Silence;
+  const r = Math.random();
+  if (r < 0.4) return mouthShapes.E;
+  if (r < 0.75) return mouthShapes.O;
+  return mouthShapes.U;
+}
+
+/**
+ * 口型动画帧循环
+ * 控制嘴巴的平滑开合动画
+ */
+function lipStep(now){
+  if (now >= lipNextAt){
+    lipPulse = 1;
+    lipPulseUntil = now + 70;
+    lipNextAt = now + lipCharMs * (0.7 + 0.6 * Math.random());
+  }
+  if (now > lipPulseUntil) lipPulse = 0;
+  mouthVal = mouthVal * 0.6 + lipPulse * 0.4;
+  const finalOpen = Math.max(0, Math.min(1, mouthVal * 0.7 + (mouthShape.open||0) * 0.3));
+  setMouth(finalOpen);
+  setMouthForm((mouthShape.form||0) * 1.0);
+  lipRaf = requestAnimationFrame(lipStep);
+}
+
+/**
+ * 开始口型同步动画
+ * 在 TTS 开始时调用
+ */
+function startLip(text, rate){
+  mouthVal = 0;
+  lipNextAt = performance.now() + 90;
+  lipCharMs = Math.max(60, 160 / Math.max(0.5, rate || 1));
+  if (!lipRaf) lipRaf = requestAnimationFrame(lipStep);
+}
+
+/**
+ * 停止口型同步动画
+ * 在 TTS 结束时调用
+ */
+function stopLip(){
+  try { if (lipRaf) cancelAnimationFrame(lipRaf); } catch(e){}
+  lipRaf = null;
+  mouthVal = 0;
+  setMouth(0);
+  setMouthForm(0);
+}
+
+/**
+ * 随机播放一个动作
+ * 排除 'idle' (待机) 动作
+ */
+function playRandomMotion(){
+  if (!model || !model.internalModel || !model.internalModel.settings) return;
+  const s = model.internalModel.settings;
+  const motions = s.motions || {};
+  const pool = [];
+  for (const g of Object.keys(motions)){
+    const list = motions[g] || [];
+    for (let i=0;i<list.length;i++){
+      const f = list[i].File || list[i].file || '';
+      if (!/idle/i.test(f)) pool.push({ group: g, idx: i });
+    }
+  }
+  if (!pool.length) return;
+  const pick = pool[Math.floor(Math.random() * pool.length)];
+  try { model.internalModel.motionManager.startMotion(pick.group, pick.idx); } catch {}
+}
+
+/**
+ * 开始说话时的随机动作循环
+ */
+function startTalkingMotions(){
+  if (talking) return;
+  talking = true;
+  playRandomMotion();
+  scheduleNextTalkingMotion();
+}
+
+/**
+ * 安排下一次随机动作播放
+ * 模拟说话时自然的手势变化
+ */
+function scheduleNextTalkingMotion(){
+  if (!talking) return;
+  const t = 1500 + Math.random() * 2500;
+  talkingTimer = setTimeout(() => { playRandomMotion(); scheduleNextTalkingMotion(); }, t);
+}
+
+/**
+ * 停止说话动作循环
+ * 并恢复到 idle 待机动作
+ */
+function stopTalkingMotions(){
+  talking = false;
+  if (talkingTimer) { clearTimeout(talkingTimer); talkingTimer = null; }
+  if (!model || !model.internalModel || !model.internalModel.settings) return;
+  const settings = model.internalModel.settings;
+  const groups = Object.keys(settings.motions || {});
+  if (groups.length) {
+    const list = settings.motions[groups[0]] || [];
+    let idx = 0;
+    for (let i=0;i<list.length;i++){
+      const f = list[i].File || list[i].file || '';
+      if (f.indexOf('idle') !== -1) { idx = i; break; }
+    }
+    try { model.internalModel.motionManager.startMotion(groups[0], idx); } catch {}
+  }
+}
+window.addEventListener('load', () => {
+  Promise.resolve(populateModels()).catch((err) => {
+    frontendLog('初始化模型列表失败: ' + (err && err.message ? err.message : String(err)));
+    if (lastModelUrl) {
+      setTimeout(() => { load(lastModelUrl, 0); }, 1000);
+    }
+  });
+  Promise.resolve(startASR()).catch((err) => {
+    frontendLog('启动ASR状态同步失败: ' + (err && err.message ? err.message : String(err)));
+  });
+});
+
+</script>
+</body>
+</html>

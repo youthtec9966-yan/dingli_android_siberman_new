@@ -1,0 +1,12 @@
+.gradle/
+.idea/
+build/
+app/build/
+app/release/
+sherpa-onnx-upstream/
+*.apk
+*.aab
+*.ap_
+local.properties
+*.iml
+gradle-8.7-bin.zip
